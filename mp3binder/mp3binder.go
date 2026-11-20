@@ -35,6 +35,34 @@ type job struct {
 	bindVisitor     bindVisitor
 	tagCopyVisitor  tagCopyVisitor
 	tagApplyVisitor tagApplyVisitor
+
+	// chapter index state
+	indexEnabled     bool
+	indexVisitor     chapterIndexVisitor
+	chapterResolver  func(index int, chapterIndex int) (bool, string)
+	chapters         []id3v2.ChapterFrame
+	chapterInputs    []int
+	chapterIDs       []string
+	inputStartTimes  []time.Duration
+	inputStartBytes  []int64
+	inputByteCounts  []int64
+	inputFrameCount  []uint32
+	currentInput     int
+	referenceRate    int
+	referenceVersion byte
+	referenceLayer   byte
+	mixedRates       bool
+	totalDuration    time.Duration
+	totalBytes       int64
+	totalFrames      uint64
+	checkpoints      []indexCheckpoint
+}
+
+// indexCheckpoint is a sample of the output timeline: a byte offset and the
+// playback time at which the audio stored there starts.
+type indexCheckpoint struct {
+	time   time.Duration
+	offset int64
 }
 
 type namedJobProcessor struct {
@@ -48,6 +76,9 @@ type (
 	bindVisitor     func(int)
 	tagCopyVisitor  func(string, string, error)
 	tagApplyVisitor func(string, string, error)
+	// chapterIndexVisitor receives one entry per chapter with its position in
+	// the output file (see ChapterIndexEntry).
+	chapterIndexVisitor func(ChapterIndexEntry)
 )
 
 type tagResolver interface {
@@ -79,6 +110,11 @@ func (b *binder) Bind(parent context.Context, output io.WriteSeeker, audioOnly i
 	return Bind(parent, b.tagResolver, output, audioOnly, input, options...)
 }
 
+// Bind joins the inputs into the output file. The audio is first collected in
+// audioOnly (which is rewound and copied to output after the ID3v2 tag is
+// written), so that the size of the final tag is known before the chapter
+// index is computed. Offsets of the index are relative to the beginning of
+// output, including the ID3v2 tag.
 func Bind(parent context.Context, tagResolver tagResolver, output io.WriteSeeker, audioOnly io.ReadWriteSeeker, input []io.Reader, options ...Option) error {
 	j := &job{
 		context:   parent,
@@ -97,11 +133,12 @@ func Bind(parent context.Context, tagResolver tagResolver, output io.WriteSeeker
 		bindVisitor:     func(int) {},
 		tagApplyVisitor: func(string, string, error) {},
 		tagCopyVisitor:  func(string, string, error) {},
+		indexVisitor:    func(ChapterIndexEntry) {},
 	}
 
 	jobProcessors := make(map[stage][]namedJobProcessor)
 
-	options = append(options, bindAudioOnly, notifyMetadata, writeMetadata, combineMetadataAndAudio)
+	options = append(options, bindAudioOnly, notifyMetadata, buildChapters, writeChapterIndex, writeMetadata, combineMetadataAndAudio)
 
 	for _, o := range options {
 		stage, name, processor := o()
@@ -136,81 +173,107 @@ func writeMetadata() (stage, string, jobProcessor) {
 	}
 }
 
+// bindStats collects the counters that describe the bound audio stream.
+type bindStats struct {
+	frames           uint32
+	bytes            uint32
+	firstBitrate     int
+	multipleBitrates bool
+	offset           int64
+}
+
+// add accounts for a frame that is written next. offset is the position of the
+// frame in the audio-only file, including the Xing/Info placeholder.
+func (s *bindStats) add(frame *mp3lib.MP3Frame) {
+	if s.firstBitrate == 0 {
+		s.firstBitrate = frame.BitRate
+	} else if !s.multipleBitrates && s.firstBitrate != frame.BitRate {
+		s.multipleBitrates = true
+	}
+
+	s.frames++
+	s.bytes += uint32(len(frame.RawBytes))
+	s.offset += int64(len(frame.RawBytes))
+}
+
 func bindAudioOnly() (stage, string, jobProcessor) {
 	return stageBind, "Binding", func(j *job) error {
 		if _, err := j.audioOnly.Write(make([]byte, emptyInfoXingFrameSize)); err != nil {
 			return err
 		}
 
-		var bytesCount uint32
-		var framesCount uint32
-		var lastBitrate int
-		var multipleBitrates bool
+		j.prepareIndex()
+
+		stats := &bindStats{offset: emptyInfoXingFrameSize}
 
 		for fileIndex, reader := range j.inputs {
-			j.bindVisitor(fileIndex)
-
-			if j.metadata[fileIndex] == nil {
-				j.metadata[fileIndex] = id3v2.NewEmptyTag()
-			}
-
-		Loop:
-			for i := 0; true; i++ {
-				select {
-				case <-j.context.Done():
-					return j.context.Err()
-				default:
-					obj := mp3lib.NextObject(reader)
-					if obj == nil {
-						break Loop
-					}
-
-					switch obj := obj.(type) {
-					case *mp3lib.MP3Frame:
-						if i == 0 && (mp3lib.IsXingHeader(obj) || mp3lib.IsVbriHeader(obj)) {
-							continue
-						}
-
-						if lastBitrate == 0 {
-							lastBitrate = obj.BitRate
-						}
-
-						if !multipleBitrates && lastBitrate != obj.BitRate {
-							multipleBitrates = true
-						}
-
-						if _, err := j.audioOnly.Write(obj.RawBytes); err != nil {
-							return err
-						}
-
-						j.inputDurations[fileIndex] += duration(obj)
-
-						framesCount++
-
-						bytesCount += uint32(len(obj.RawBytes))
-
-					case *mp3lib.ID3v2Tag:
-						tag, err := id3v2.ParseReader(bytes.NewReader(obj.RawBytes), id3v2.Options{Parse: true})
-						if err != nil {
-							return err
-						}
-
-						for id := range tag.AllFrames() {
-							j.metadata[fileIndex].AddFrame(id, tag.GetLastFrame(id))
-						}
-
-					default:
-						continue
-					}
-				}
+			if err := j.bindInput(fileIndex, reader, stats); err != nil {
+				return err
 			}
 		}
 
-		if err := writeBitrateHeader(j.audioOnly, framesCount, bytesCount, multipleBitrates); err != nil {
+		if err := writeBitrateHeader(j.audioOnly, stats, j.indexEnabled, j.toc()); err != nil {
 			return err
 		}
 
 		return nil
+	}
+}
+
+// bindInput appends all audio frames of one input to the audio-only file.
+func (j *job) bindInput(fileIndex int, reader io.Reader, stats *bindStats) error {
+	j.bindVisitor(fileIndex)
+
+	if j.metadata[fileIndex] == nil {
+		j.metadata[fileIndex] = id3v2.NewEmptyTag()
+	}
+
+	j.beginInput(fileIndex, stats.offset)
+	defer j.endInput(fileIndex)
+
+	for i := 0; ; i++ {
+		select {
+		case <-j.context.Done():
+			return j.context.Err()
+		default:
+			obj := mp3lib.NextObject(reader)
+			if obj == nil {
+				return nil
+			}
+
+			switch obj := obj.(type) {
+			case *mp3lib.MP3Frame:
+				// A leading Xing/VBRI frame is a header of the input, not
+				// audio; it must neither be bound nor indexed.
+				if i == 0 && (mp3lib.IsXingHeader(obj) || mp3lib.IsVbriHeader(obj)) {
+					continue
+				}
+
+				if j.indexEnabled {
+					j.addIndexFrame(obj, stats.offset)
+				}
+
+				if _, err := j.audioOnly.Write(obj.RawBytes); err != nil {
+					return err
+				}
+
+				j.inputDurations[fileIndex] += duration(obj)
+				stats.add(obj)
+
+			case *mp3lib.ID3v2Tag:
+				tag, err := id3v2.ParseReader(bytes.NewReader(obj.RawBytes), id3v2.Options{Parse: true})
+				if err != nil {
+					return err
+				}
+
+				for id := range tag.AllFrames() {
+					j.metadata[fileIndex].AddFrame(id, tag.GetLastFrame(id))
+				}
+
+			default:
+				continue
+			}
+		}
 	}
 }
 
@@ -219,7 +282,6 @@ func tagToMap(tag *id3v2.Tag) map[string]string {
 	if tag == nil || !tag.HasFrames() {
 		return m
 	}
-
 	for id := range tag.AllFrames() {
 		f := tag.GetLastFrame(id)
 		if tf, ok := f.(id3v2.TextFrame); ok {
@@ -240,17 +302,30 @@ func notifyMetadata() (stage, string, jobProcessor) {
 	}
 }
 
-func writeBitrateHeader(out io.WriteSeeker, framesCount, bytesCount uint32, multipleBitrates bool) error {
-	var emptyInfoXingFrameOffset int64 = int64(bytesCount) + emptyInfoXingFrameSize
+func writeBitrateHeader(out io.WriteSeeker, stats *bindStats, withIndex bool, toc []byte) error {
+	var emptyInfoXingFrameOffset int64 = int64(stats.bytes) + emptyInfoXingFrameSize
 	if _, err := out.Seek(emptyInfoXingFrameOffset*-1, io.SeekCurrent); err != nil {
 		return fmt.Errorf("can not seek to info/xing frame, %v", err)
 	}
 
-	header := mp3lib.NewXingHeader(framesCount, bytesCount)
+	header := mp3lib.NewXingHeader(stats.frames, stats.bytes)
 
-	if multipleBitrates {
-		offset := 4 + getSideInfoSize(header)
-		copy(header.RawBytes[offset:offset+4], `Info`)
+	// The Xing marker denotes a VBR stream and the Info marker a CBR stream.
+	// The historical output of this tool used the opposite labels, which is
+	// kept for the original (index-less) merge mode so that its output does
+	// not change. With an index the standard labels are used: a VBR file is
+	// then recognised as VBR by players, which is a precondition for them to
+	// consult the TOC without being asked to.
+	marker := "Xing"
+	if stats.multipleBitrates != withIndex {
+		marker = "Info"
+	}
+
+	offset := 4 + getSideInfoSize(header)
+	copy(header.RawBytes[offset:offset+4], marker)
+
+	if withIndex {
+		writeTOC(header, toc)
 	}
 
 	if _, err := out.Write(header.RawBytes); err != nil {

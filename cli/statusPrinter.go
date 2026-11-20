@@ -6,6 +6,8 @@ import (
 	"io"
 	"path/filepath"
 	"strconv"
+
+	"github.com/crra/mp3binder/mp3binder"
 )
 
 type discardingPrinter struct {
@@ -33,6 +35,10 @@ func (d *discardingPrinter) newTagObserver(tags map[string]string) func(tag, val
 	return func(tag, value string, err error) {}
 }
 
+func (d *discardingPrinter) newChapterIndexObserver() func(entry mp3binder.ChapterIndexEntry) {
+	return func(entry mp3binder.ChapterIndexEntry) {}
+}
+
 type verbosePrinter struct {
 	output io.Writer
 }
@@ -55,7 +61,6 @@ func (p *verbosePrinter) listMediaFilesAfterInterlace(mediaFiles []string) {
 	p.list(mediaFiles, "Files to bind after applying the interlace file:")
 }
 
-//
 func (p *verbosePrinter) list(mediaFiles []string, title string) {
 	padding := len(strconv.Itoa(len(mediaFiles)))
 
@@ -135,6 +140,30 @@ func (p *verbosePrinter) newTagObserver(tags map[string]string) func(tag, value 
 			fmt.Fprintf(p.output, "- Removing tag: '%s'\n", tag)
 		default:
 			fmt.Fprintf(p.output, "- Adding tag: '%s' with value '%s'\n", tag, value)
+		}
+	}
+}
+
+func (p *verbosePrinter) newChapterIndexObserver() func(entry mp3binder.ChapterIndexEntry) {
+	reported := false
+
+	return func(entry mp3binder.ChapterIndexEntry) {
+		if !reported {
+			reported = true
+			if entry.TOC {
+				fmt.Fprintln(p.output, "- Writing a Xing table of contents for coarse seeking")
+			} else {
+				fmt.Fprintln(p.output, "- No Xing table of contents: the stream is not a single 44.1 kHz MPEG-1 Layer III stream")
+			}
+		}
+
+		switch {
+		case entry.Empty:
+			fmt.Fprintf(p.output, "- Chapter %d has no audio, offset falls back to time\n", entry.Chapter)
+		case entry.OffsetOverflow:
+			fmt.Fprintf(p.output, "- Chapter %d starts beyond the 32-bit offset range, offset falls back to time\n", entry.Chapter)
+		default:
+			fmt.Fprintf(p.output, "- Chapter %d at byte offset %d (frame %d)\n", entry.Chapter, entry.StartOffset, entry.Frames)
 		}
 	}
 }

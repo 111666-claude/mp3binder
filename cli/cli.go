@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/crra/mp3binder/slice"
-
 	"github.com/carolynvs/aferox"
+	"github.com/crra/mp3binder/mp3binder"
+	"github.com/crra/mp3binder/slice"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 	"golang.org/x/text/language"
@@ -66,6 +66,7 @@ type statusPrinter interface {
 	newBindObserver(mediaFiles []string) func(index int)
 	newTagCopyObserver(copyFilename string) func(tag, value string, err error)
 	newTagObserver(tags map[string]string) func(tag, value string, err error)
+	newChapterIndexObserver() func(entry mp3binder.ChapterIndexEntry)
 }
 
 // Service describes the cli service.

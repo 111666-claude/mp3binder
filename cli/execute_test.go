@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/carolynvs/aferox"
@@ -120,4 +121,25 @@ func TestInterlaceWithThree(t *testing.T) {
 		assert.Equal(t, filepathJoin(root, validFileName1, validInterlaceFile1, validFileName2, validInterlaceFile1, validFileName3), a.mediaFiles)
 		assert.Equal(t, len(a.mediaFiles), len(tc.input))
 	}
+}
+
+func TestChapterIndexUsesVerboseStatusPrinter(t *testing.T) {
+	t.Parallel()
+
+	builder := &strings.Builder{}
+	printer := newVerbosePrinter(builder)
+	observer := printer.newChapterIndexObserver()
+
+	observer(mp3binder.ChapterIndexEntry{Chapter: 1, StartOffset: 1000, Frames: 10, TOC: true})
+	observer(mp3binder.ChapterIndexEntry{Chapter: 2, StartOffset: 2000, Frames: 10, TOC: true})
+	observer(mp3binder.ChapterIndexEntry{Chapter: 3, Empty: true})
+	observer(mp3binder.ChapterIndexEntry{Chapter: 4, OffsetOverflow: true})
+
+	output := builder.String()
+	assert.Contains(t, output, "Xing table of contents")
+	assert.Contains(t, output, "Chapter 1 at byte offset 1000 (frame 10)")
+	assert.Contains(t, output, "Chapter 2 at byte offset 2000 (frame 10)")
+	assert.Contains(t, output, "Chapter 3 has no audio")
+	assert.Contains(t, output, "Chapter 4 starts beyond the 32-bit offset")
+	assert.Equal(t, 1, strings.Count(output, "Xing table of contents"))
 }

@@ -25,6 +25,8 @@ _mp3binder_:
   - or automatically if the folder of the mp3 files contain a `_interlace.mp3` file
   - the automation can be disabled with the command line option `--nodiscovery`
 - can write **chapters** based on the id3v2 title of the input files
+  - each chapter carries the byte offset of its first audio frame, so players can jump to it directly
+  - a **Xing/Info table of contents** (100 entries) is written for coarse seeking in players that only support a percentage-based seek bar
   - it can be disabled with the command line option: `--nochapters`
 - can write **id3v2 tags** to the output file via the command line option: `--tapply 'TIT2="My Title",TALB="My album"'`
   - the key can be any valid tag from the [id3v2 standard](https://id3.org/id3v2.3.0#Declared_ID3v2_frames)
@@ -94,6 +96,42 @@ ID3 tags could also be set manually. The name of the tag must be according to ht
 - `$ mp3binder . --tapply "TIT2=\"It's like that\""`
 
 Please notice the surrounding quotes and ensure proper quoting.
+
+# Chapters and seeking
+
+Without `--nochapters`, every input file becomes a chapter of the output. Each
+`CHAP` frame is written with:
+
+- a start and end time (milliseconds from the beginning of the bound file), and
+- a start and end byte offset to the first complete audio frame of the chapter.
+
+The byte offsets are absolute positions in the final file, i.e. they include the
+ID3v2 tag that precedes the audio. They are computed while binding, so they are
+correct for CBR and VBR input, for inputs with different frame lengths and for
+inputs that start with an ID3v2 tag. The original merge mode (with
+`--nochapters`) is unchanged and writes the audio stream exactly as before.
+
+In addition, a Xing/Info table of contents is written into the VBR header of
+the output. Its 100 entries point at the audio position of each percent of the
+total duration, which is what players use to implement a coarse seek bar. The
+table is only written when all bound frames are MPEG-1 Layer III at 44.1 kHz,
+because the header frame itself is fixed to that format; for other sampling
+rates, MPEG versions or mixed inputs the chapter byte offsets are still written
+but the table is omitted (players then use the chapter times). Use
+`--verbose` to see the offset of each chapter and whether a table of contents
+was written.
+
+Edge cases:
+
+- an **empty** input creates a chapter with identical start and end time and no
+  byte offset, so players fall back to the time,
+- **truncated** frames and garbage between frames are skipped; a chapter offset
+  always points at the first complete frame,
+- a chapter that would start at a byte position that does not fit into the
+  32-bit offset field of the chapter specification has no byte offset and uses
+  its time instead,
+- **duplicate chapter titles** are preserved; chapter element IDs are derived
+  from the position, so every chapter remains addressable.
 
 # Silence between each tracks via interlace file
 

@@ -20,6 +20,7 @@ const (
 	stageCopyMetadata
 	stageApplyMetadata
 	stageBuildChapers
+	stageWriteIndex
 	stageWriteMetadata
 
 	stageCombineId3AndAudio
@@ -181,52 +182,94 @@ func Cover(mimeType string, r io.Reader) Option {
 }
 
 // Chapters uses a callback function to resolve the title of the chapter for a file that bound.
+//
+// When the callback skips a file, the file's audio is still appended to the
+// output but no chapter is created for it (e.g. an interlace file). Enabling
+// chapters also enables the chapter index: every chapter start is recorded as
+// a byte offset in the bound file and a Xing/Info TOC is written for coarse
+// seeking.
 func Chapters(resolveFunc func(index int, chapterIndex int) (bool, string)) Option {
 	return func() (stage, string, jobProcessor) {
-		return stageBuildChapers, "adding chapters", func(j *job) error {
-			var start time.Duration
+		return stageInit, "chapter resolver", func(j *job) error {
+			j.chapterResolver = resolveFunc
+			j.indexEnabled = true
 
-			chaptersIds := make([]string, 0, len(j.metadata))
-			chapterIndex := 1
-			for i, numberOfFiles := 0, len(j.inputDurations); i < numberOfFiles; i++ {
-				end := start + j.inputDurations[i]
+			return nil
+		}
+	}
+}
 
-				createChapter, chapterTitle := resolveFunc(i, chapterIndex)
+// buildChapters creates one chapter frame per input file (as accepted by the
+// resolver registered through Chapters). The byte offsets are filled in later
+// by the index stage, once the size of the final tag is known.
+func buildChapters() (stage, string, jobProcessor) {
+	return stageBuildChapers, "adding chapters", func(j *job) error {
+		if j.chapterResolver == nil {
+			return nil
+		}
 
-				if !createChapter {
-					// skip (e.g. due to an interlace file)
-					continue
-				}
+		var start time.Duration
 
-				chapterId := fmt.Sprintf("c%d", chapterIndex)
+		chapterIndex := 1
+		for i, numberOfFiles := 0, len(j.inputDurations); i < numberOfFiles; i++ {
+			// The timeline follows the bound audio, including inputs that
+			// are skipped as chapters (e.g. interlace files). The recorded
+			// start time is exact even for inputs with an unusual frame
+			// length because it comes from the bind stage itself.
+			start = j.inputStartTimes[i]
 
-				j.tag.AddChapterFrame(id3v2.ChapterFrame{
-					ElementID:   chapterId,
-					StartTime:   start,
-					EndTime:     end,
-					StartOffset: id3v2.IgnoredOffset,
-					EndOffset:   id3v2.IgnoredOffset,
-					Title: &id3v2.TextFrame{
-						Encoding: id3v2.EncodingUTF8,
-						Text:     chapterTitle,
-					},
-				})
+			end := start + j.inputDurations[i]
 
-				j.tagApplyVisitor(fmt.Sprintf("Chapter: %d from '%s' to '%s'", chapterIndex, start.Round(time.Second), end.Round(time.Second)), chapterTitle, nil)
-
-				chaptersIds = append(chaptersIds, chapterId)
-				start = end
-				chapterIndex++
+			createChapter, chapterTitle := j.chapterResolver(i, chapterIndex)
+			if !createChapter {
+				continue
 			}
 
-			if len(chaptersIds) > 0 {
-				j.tag.AddChapterTocFrame(id3v2.ChapterTocFrame{
-					ElementID:  "MainChapterToc",
-					TopLevel:   true,
-					Ordered:    true,
-					ChapterIds: chaptersIds,
-				})
+			// The element ID is derived from the position in the output, not
+			// from the title: duplicate titles are valid and must not produce
+			// duplicate (and therefore ignored) chapter frames.
+			chapter := id3v2.ChapterFrame{
+				ElementID:   fmt.Sprintf("c%d", chapterIndex),
+				StartTime:   start,
+				EndTime:     end,
+				StartOffset: id3v2.IgnoredOffset,
+				EndOffset:   id3v2.IgnoredOffset,
+				Title: &id3v2.TextFrame{
+					Encoding: id3v2.EncodingUTF8,
+					Text:     chapterTitle,
+				},
 			}
+
+			j.tag.AddChapterFrame(chapter)
+			j.chapters = append(j.chapters, chapter)
+			j.chapterInputs = append(j.chapterInputs, i)
+
+			j.tagApplyVisitor(fmt.Sprintf("Chapter: %d from '%s' to '%s'", chapterIndex, start.Round(time.Second), end.Round(time.Second)), chapterTitle, nil)
+
+			j.chapterIDs = append(j.chapterIDs, chapter.ElementID)
+			chapterIndex++
+		}
+
+		if len(j.chapterIDs) > 0 {
+			j.tag.AddChapterTocFrame(id3v2.ChapterTocFrame{
+				ElementID:  "MainChapterToc",
+				TopLevel:   true,
+				Ordered:    true,
+				ChapterIds: j.chapterIDs,
+			})
+		}
+
+		return nil
+	}
+}
+
+// ChapterIndexVisitor registers a callback that receives each chapter with its
+// position in the final output file. The callback is invoked after all audio is
+// bound and the final tag size is known.
+func ChapterIndexVisitor(f chapterIndexVisitor) Option {
+	return func() (stage, string, jobProcessor) {
+		return stageInit, "chapter index visitor", func(j *job) error {
+			j.indexVisitor = f
 
 			return nil
 		}

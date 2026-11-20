@@ -173,6 +173,8 @@ func (a *application) bindingOptions() ([]any, func(), error) {
 
 			return (a.interlaceFile == "") || (a.mediaFiles[index] != a.interlaceFile), chapterTitle
 		}))
+
+		options = append(options, mp3binder.ChapterIndexVisitor(a.statusPrinter.newChapterIndexObserver()))
 	}
 
 	// cover file
